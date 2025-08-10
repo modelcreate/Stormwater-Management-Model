@@ -208,3 +208,137 @@ if (exprIndex < 0 && v1.attribute != v2.attribute) report_writeWarningMsg(WARN11
 - The expression engine is self-contained (`mathexpr.c/h`) with callback hooks for variable name resolution and value retrieval
 - Named variables are resolved by name at parse/compile time and evaluated by index at runtime
 - Premise clauses allow either expressions or plain variables on LHS; RHS is variable or literal
+
+### Enums and Keywords in `controls.c`
+- Enums: `RuleState`, `RuleObject`, `RuleAttrib`, `RuleRelation`, `RuleSetting`
+
+```65:75:swmm/src/solver/controls.c
+enum RuleState    {r_RULE, r_IF, r_AND, r_OR, r_THEN, r_ELSE, r_PRIORITY,
+                   r_VARIABLE, r_EXPRESSION, r_ERROR};
+enum RuleObject   {r_GAGE, r_NODE, r_LINK, r_CONDUIT, r_PUMP, r_ORIFICE,
+                   r_WEIR, r_OUTLET, r_SIMULATION};
+enum RuleAttrib   {r_DEPTH, r_MAXDEPTH, r_HEAD, r_VOLUME, r_INFLOW,
+                   r_FLOW, r_FULLFLOW, r_FULLDEPTH, r_STATUS, r_SETTING,
+                   r_LENGTH, r_SLOPE, r_VELOCITY, r_TIMEOPEN, r_TIMECLOSED,
+                   r_TIME, r_DATE, r_CLOCKTIME, r_DAYOFYEAR, r_DAY, r_MONTH};
+enum RuleRelation {EQ, NE, LT, LE, GT, GE};
+enum RuleSetting  {r_CURVE, r_TIMESERIES, r_PID, r_NUMERIC};
+```
+
+- Keyword tables: `ObjectWords[]`, `AttribWords[]`, `RelOpWords[]`, `StatusWords[]`, `ConduitWords[]`, `SettingTypeWords[]`
+
+```78:90:swmm/src/solver/controls.c
+static char* ObjectWords[] = {"GAGE","NODE","LINK","CONDUIT","PUMP","ORIFICE","WEIR","OUTLET","SIMULATION", NULL};
+static char* AttribWords[] = {"DEPTH","MAXDEPTH","HEAD","VOLUME","INFLOW","FLOW","FULLFLOW","FULLDEPTH","STATUS","SETTING","LENGTH","SLOPE","VELOCITY","TIMEOPEN","TIMECLOSED","TIME","DATE","CLOCKTIME","DAYOFYEAR","DAY","MONTH", NULL};
+```
+
+### Core Functions Inventory (with roles)
+- Lifecycle
+  - `controls_init()` initializes globals
+  - `controls_addToCount(char* s)` counts VARIABLE/EXPRESSION lines
+  - `controls_create(int n)` allocates arrays for rules, named variables, expressions
+  - `controls_delete()` frees expressions, variables, rules, and action list
+
+```226:239:swmm/src/solver/controls.c
+void controls_init() { Rules = NULL; NamedVariable = NULL; Expression = NULL; RuleCount = 0; VariableCount = 0; ExpressionCount = 0; }
+```
+
+- INP Parsing and Rule Building
+  - `controls_addVariable(char* tok[], int nToks)` adds named variable
+  - `controls_addExpression(char* tok[], int nToks)` compiles and stores expression
+  - `controls_addRuleClause(int r, int keyword, char* tok[], int nToks)` dispatches to `addPremise` or `addAction`
+  - `addPremise(...)` parses a premise: possible expression LHS or named variable, relation, and RHS variable or value
+  - `getPremiseVariable(...)` parses `<OBJECT ID ATTRIBUTE>` or `SIMULATION ATTRIBUTE`
+  - `getPremiseValue(...)` parses RHS literal given attribute context (supports time/date/status)
+  - `addAction(...)` parses control actions and optional modulated settings (Curve, Time Series, PID)
+  - `setActionSetting(...)` handles action setting types
+
+```556:664:swmm/src/solver/controls.c
+int addPremise(int r, int type, char* tok[], int nToks) { ... p->exprIndex = exprIndex; p->lhsVar = v1; p->rhsVar = v2; p->relation = relation; p->value = value; }
+```
+
+```668:793:swmm/src/solver/controls.c
+int getPremiseVariable(char* tok[], int nToks, int* k, struct TVariable* v);
+```
+
+```824:885:swmm/src/solver/controls.c
+int getPremiseValue(char* token, int attrib, double* value);
+```
+
+```889:1024:swmm/src/solver/controls.c
+int addAction(int r, char* tok[], int nToks); // validates object type, attribute, and setting
+```
+
+```1028:1082:swmm/src/solver/controls.c
+int setActionSetting(char* tok[], int nToks, int* curve, int* tseries, int* attrib, double values[]);
+```
+
+- Expression/Variable Lookup
+  - `getVariableIndex(char* varName)`; `getNamedVariableValue(int varIndex)`
+  - `getExpressionIndex(char* exprName)`
+
+```393:417:swmm/src/solver/controls.c
+int getVariableIndex(char* varName);
+double getNamedVariableValue(int varIndex);
+int getExpressionIndex(char* exprName);
+```
+
+- Evaluation
+  - `controls_evaluate(DateTime currentTime, DateTime elapsedTime, double tStep)` iterates rules, evaluates premises, updates action list, executes actions
+  - `evaluatePremise(struct TPremise* p, double tStep)` computes lhs/rhs and compares
+  - `getVariableValue(struct TVariable v)` retrieves live values
+  - `compareTimes(...)`, `compareValues(...)`
+  - Action list helpers: `updateActionValue`, `getPIDSetting`, `updateActionList`, `executeActionList`, `clearActionList`, `deleteActionList`, `deleteRules`
+
+```495:552:swmm/src/solver/controls.c
+int controls_evaluate(DateTime currentTime, DateTime elapsedTime, double tStep);
+```
+
+```1243:1281:swmm/src/solver/controls.c
+int evaluatePremise(struct TPremise* p, double tStep);
+```
+
+```1286:1384:swmm/src/solver/controls.c
+double getVariableValue(struct TVariable v);
+```
+
+### Rule Evaluation Schedule
+- Rule evaluation is invoked from the routing step logic when the rule time is reached (uses internal scheduling like `RuleStep`)
+
+```278:283:swmm/src/solver/routing.c
+if (RuleStep == 0 || fabs(NewRoutingTime - NewRuleTime) < 1.0)
+{  controls_evaluate(currentDate, currentDate - StartDateTime, routingStep / SECperDAY); }
+```
+
+- `w_RULE_STEP` option keyword exists to configure rule evaluation frequency
+
+```77:86:swmm/src/solver/text.h
+#define  w_RULE_STEP         "RULE_STEP"
+```
+
+### Expression Engine Details
+- Creation and evaluation API:
+
+```26:33:swmm/src/solver/mathexpr.h
+MathExpr* mathexpr_create(char* s, int (*getVar) (char *));
+double    mathexpr_eval(MathExpr* expr, double (*getVal) (int));
+void      mathexpr_delete(MathExpr* expr);
+```
+
+- Operators and functions supported (opcode mapping):
+
+```14:44:swmm/src/solver/mathexpr.c
+// 7 number, 8 variable, 31 ^, and functions: cos,sin,tan,cot,abs,sgn,sqrt,log,exp,asin,acos,atan,acot,sinh,cosh,tanh,coth,log10,step
+```
+
+### INP Read/Write Summary
+- Read: `[CONTROLS]` section processed in two passes; variable/expression lines handled before rule clauses.
+- Write: The SWMM solver library does not implement INP writing of control definitions; UI/front-ends handle INP serialization. Only input summaries are written (`inputrpt.c`).
+
+### Cross-References and Warnings
+- Mixed-attribute variable-to-variable comparisons (non-expression) generate warning `WARN11` during premise parsing.
+
+```626:630:swmm/src/solver/controls.c
+if (exprIndex < 0 && v1.attribute != v2.attribute)
+    report_writeWarningMsg(WARN11, Rules[r].ID);
+```
